@@ -140,6 +140,12 @@ pub struct ArrowWriter<W: Write> {
 
     /// The length of arrays to write to each row group
     max_row_group_size: usize,
+
+    /// The column index to use for clustering row groups
+    /// Rows with different values are guaranteed to end up in different row groups
+    /// Rows with the same value are likely (but not guaranteed) to end up in the same row group
+    /// This is an index into the schema fields
+    row_group_clustering_column: Option<usize>,
 }
 
 impl<W: Write + Send> std::fmt::Debug for ArrowWriter<W> {
@@ -191,6 +197,29 @@ impl<W: Write + Send> ArrowWriter<W> {
         }
 
         let max_row_group_size = props.max_row_group_size();
+        let row_group_clustering_column = props.row_group_clustering_column();
+        if let Some(row_group_clustering_column) = row_group_clustering_column {
+            if row_group_clustering_column >= arrow_schema.fields().len() {
+                return Err(ParquetError::General(format!(
+                    "Clustering column index {row_group_clustering_column} out of bounds for schema with {} fields",
+                    arrow_schema.fields().len(),
+                )));
+            }
+            let field = arrow_schema.field(row_group_clustering_column);
+            // check that the data type is one of u8, u16, u32 or u64
+            if !matches!(
+                field.data_type(),
+                ArrowDataType::UInt8
+                    | ArrowDataType::UInt16
+                    | ArrowDataType::UInt32
+                    | ArrowDataType::UInt64
+            ) {
+                return Err(ParquetError::General(format!(
+                    "Clustering column {} must be a u8, u16, u32 or u64",
+                    field.name(),
+                )));
+            }
+        }
 
         let file_writer =
             SerializedFileWriter::new(writer, schema.root_schema_ptr(), Arc::new(props))?;
@@ -200,6 +229,7 @@ impl<W: Write + Send> ArrowWriter<W> {
             in_progress: None,
             arrow_schema,
             max_row_group_size,
+            row_group_clustering_column,
         })
     }
 
@@ -261,7 +291,7 @@ impl<W: Write + Send> ArrowWriter<W> {
             return Ok(());
         }
 
-        let in_progress = match &mut self.in_progress {
+        let mut in_progress = match &mut self.in_progress {
             Some(in_progress) => in_progress,
             x => x.insert(ArrowRowGroupWriter::new(
                 self.writer.schema_descr(),
@@ -279,12 +309,72 @@ impl<W: Write + Send> ArrowWriter<W> {
             return self.write(&b);
         }
 
-        in_progress.write(batch)?;
+        if let Some(clustering_column) = self.row_group_clustering_column {
+            // safety: we checked bounds against the schema when creating the writer
+            let column = batch.column(clustering_column);
+            // extract to a u8, u16, u32 or u64
+            let clustering_values = match column.data_type() {
+                ArrowDataType::UInt8 => Self::value_change_indices(column.as_any().downcast_ref::<arrow_array::UInt8Array>().unwrap()),
+                ArrowDataType::UInt16 => Self::value_change_indices(column.as_any().downcast_ref::<arrow_array::UInt16Array>().unwrap()),
+                ArrowDataType::UInt32 => Self::value_change_indices(column.as_any().downcast_ref::<arrow_array::UInt32Array>().unwrap()),
+                ArrowDataType::UInt64 => Self::value_change_indices(column.as_any().downcast_ref::<arrow_array::UInt64Array>().unwrap()),
+                _ => unreachable!(), // safety: we checked types against the schema when creating the writer
+            };
+            // split batch into row groups
+            for (mut previous, next) in clustering_values.iter().cloned().zip(clustering_values.iter().skip(1)) {
+                while next - previous > self.max_row_group_size {
+                    // split into multiple row groups
+                    let slice = batch.slice(previous, self.max_row_group_size);
+                    previous = previous + self.max_row_group_size;
+                    in_progress.write(&slice)?;
+                    self.flush()?;
+                    let new_rg = ArrowRowGroupWriter::new(
+                        self.writer.schema_descr(),
+                        self.writer.properties(),
+                        &self.arrow_schema,
+                    )?;
+                    in_progress = self.in_progress.insert(new_rg);
+                }
+                let slice = batch.slice(previous, next - previous);
+                in_progress.write(&slice)?;
+                self.flush()?;
+                let new_rg = ArrowRowGroupWriter::new(
+                    self.writer.schema_descr(),
+                    self.writer.properties(),
+                    &self.arrow_schema,
+                )?;
+                in_progress = self.in_progress.insert(new_rg);
+            }
+        } else {
+            in_progress.write(batch)?;
+        }
 
         if in_progress.buffered_rows >= self.max_row_group_size {
             self.flush()?
         }
         Ok(())
+    }
+
+    /// Find indices where a value switches
+    fn value_change_indices<T, N>(array: &arrow_array::PrimitiveArray<T>) -> Vec<usize>
+    where
+        T: arrow_array::ArrowPrimitiveType<Native = N>,
+        N: PartialEq + Copy,
+    
+    {
+        let mut indices = vec![0];
+        if array.len() == 0 {
+            return indices;
+        }
+        let mut last = array.value(0);
+        for i in 1..array.len() {
+            let value = array.value(i);
+            if value != last {
+                indices.push(i);
+                last = value;
+            }
+        }
+        indices
     }
 
     /// Flushes all buffered rows into a new row group
@@ -3311,5 +3401,35 @@ mod tests {
             err,
             "Arrow: Incompatible type. Field 'temperature' has type Float64, array has type Int32"
         );
+    }
+
+    #[test]
+    fn test_clustering_column() {
+        let batch_schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("clustering", DataType::UInt32, false),
+        ]);
+        let a = Int32Array::from(vec![1, 2, 3, 4]);
+        let b = Int32Array::from(vec![5, 6, 7, 8]);
+        let clustering = UInt32Array::from(vec![0, 0, 1, 2]);
+        let batch = RecordBatch::try_new(
+            Arc::new(batch_schema),
+            vec![
+                Arc::new(a) as _,
+                Arc::new(b) as _,
+                Arc::new(clustering) as _,
+            ],
+        ).unwrap();
+
+        let mut buf = Vec::with_capacity(1024);
+        let props = WriterProperties::builder()
+            .set_row_group_clustering_column(2)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+
+        let metadata = writer.close().unwrap();
+        assert_eq!(metadata.row_groups.len(), 3);
     }
 }

@@ -163,6 +163,7 @@ pub struct WriterProperties {
     sorting_columns: Option<Vec<SortingColumn>>,
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
+    row_group_clustering_column: Option<usize>,
 }
 
 impl Default for WriterProperties {
@@ -357,6 +358,12 @@ impl WriterProperties {
             .and_then(|c| c.bloom_filter_properties())
             .or_else(|| self.default_column_properties.bloom_filter_properties())
     }
+
+    /// Returns the clustering column index for row groups.
+    /// If set, the row groups will be clustered by the values of this column.
+    pub fn row_group_clustering_column(&self) -> Option<usize> {
+        self.row_group_clustering_column
+    }
 }
 
 /// Builder for  [`WriterProperties`] parquet writer configuration.
@@ -377,6 +384,7 @@ pub struct WriterPropertiesBuilder {
     sorting_columns: Option<Vec<SortingColumn>>,
     column_index_truncate_length: Option<usize>,
     statistics_truncate_length: Option<usize>,
+    row_group_clustering_column: Option<usize>,
 }
 
 impl WriterPropertiesBuilder {
@@ -397,6 +405,7 @@ impl WriterPropertiesBuilder {
             sorting_columns: None,
             column_index_truncate_length: DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH,
             statistics_truncate_length: DEFAULT_STATISTICS_TRUNCATE_LENGTH,
+            row_group_clustering_column: None,
         }
     }
 
@@ -417,6 +426,7 @@ impl WriterPropertiesBuilder {
             sorting_columns: self.sorting_columns,
             column_index_truncate_length: self.column_index_truncate_length,
             statistics_truncate_length: self.statistics_truncate_length,
+            row_group_clustering_column: self.row_group_clustering_column,
         }
     }
 
@@ -518,6 +528,19 @@ impl WriterPropertiesBuilder {
         assert!(value > 0, "Cannot have a 0 max row group size");
         self.max_row_group_size = value;
         self
+    }
+
+    /// Set the column index to use for clustering row groups.
+    /// 
+    /// Rows with different values are guaranteed to end up in different row groups.
+    /// Rows with the same value are likely (but not guaranteed) to end up in the same row group.
+    /// 
+    /// This is an index into the schema fields.
+    pub fn set_row_group_clustering_column(self, column: usize) -> Self {
+        Self {
+            row_group_clustering_column: Some(column),
+            ..self
+        }
     }
 
     /// Sets where in the final file Bloom Filters are written (default `AfterRowGroup`)
